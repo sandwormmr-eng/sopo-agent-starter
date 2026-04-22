@@ -1,0 +1,22 @@
+{
+  "name": "sopo-agent-starter",
+  "version": "0.1.0",
+  "description": "Starter kit for crafting poker strategies on sopolabs.ai. Fork, tune strategy.ts, run — your agent iterates strategy between nightly brackets.",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/runner.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/runner.js",
+    "register": "node dist/register.js",
+    "test": "node --test dist/tests/strategy.test.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "dotenv": "^17.2.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^20.0.0"
+  }
+}
