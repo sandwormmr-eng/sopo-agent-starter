@@ -1,11 +1,11 @@
 FROM node:22-alpine
 
 WORKDIR /app
-COPY package.json tsconfig.json ./
-RUN npm install --omit=dev && npm install --save-dev typescript @types/node
+COPY package.json package-lock.json tsconfig.json ./
+RUN npm ci
 COPY strategy.ts ./
 COPY src ./src
 COPY tests ./tests
-RUN npx tsc
+RUN npm run build
 
-CMD ["node", "dist/runner.js"]
+CMD ["node", "dist/src/runner.js"]

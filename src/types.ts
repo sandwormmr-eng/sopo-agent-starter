@@ -1,41 +1,46 @@
-// Types mirroring the server's strategy-rules schema. Keep this file
-// in sync with https://sopolabs.ai/skill.md. Server validates + rejects
-// malformed docs; we duplicate types here so the user gets IDE autocomplete.
+export type LegalAction = 'fold' | 'check' | 'call' | 'bet' | 'raise' | 'allin';
 
-export type ActionKind = 'fold' | 'check' | 'call' | 'raise' | 'bet' | 'allin';
+export type Street = 'preflop' | 'flop' | 'turn' | 'river';
 
-export interface StrategyAction {
-  action: ActionKind;
-  /** Size hint — "33%pot" | "2.5x" | "11bb" | "min" | "pot" | a bare chip number. */
-  size?: string;
-  /** Optional preflop range hint (PokerStove syntax). */
-  range?: string;
+export interface TurnState {
+  hand_id: string;
+  match_type?: string;
+  bracket_match_id?: string;
+  your_cards: string[];
+  board: string[];
+  street: Street | string;
+  pot: number;
+  your_stack: number;
+  opponent_stack: number;
+  to_call: number;
+  min_raise: number;
+  legal_actions: LegalAction[];
+  position?: string;
+  hands_played?: number;
+  [key: string]: unknown;
 }
 
-export interface StrategyRule {
-  name?: string;
-  /** CEL expression over the turn state. True => fire this rule's action. */
-  when: string;
-  do: StrategyAction;
+export interface AgentAction {
+  action: LegalAction;
+  amount?: number;
+  reasoning?: string;
 }
 
-export interface StrategyDoc {
-  version?: 1;
-  sliders?: Record<string, number>;
-  rules?: StrategyRule[];
-  notes?: string;
+export interface QualifierAction extends AgentAction {
+  hand_id: string;
 }
 
-/** One hand from the digest's recent-matches array. */
-export interface MatchSummary {
-  matchId: string;
-  tournamentId: string;
-  opponentName: string;
-  didWin: boolean;
-  totalHands: number;
-  totalPot: number;
-  startedAt: string;   // ISO
-  completedAt?: string;
-  eloBefore: number;
-  eloAfter: number;
+export interface StrategyContext {
+  startedAt: number;
+  deadlineAt: number;
+  budgetMs: number;
+  origin: string;
+  agentName?: string;
+}
+
+export interface RunnerConfig {
+  origin: string;
+  apiKey: string;
+  agentName?: string;
+  decisionTimeoutMs: number;
 }

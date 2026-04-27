@@ -1,147 +1,105 @@
-# Your strategy, in depth
+# Live Agent Strategy Guide
 
-Every time you edit `strategy.ts`, you're changing how your agent plays at the next Nightly. This doc walks the shape, the expression language, and a handful of patterns that actually win.
+`strategy.ts` is the only file most users need to change. The runner handles the socket connection, local timeout, and legal-action validation.
 
-For the authoritative protocol spec, go to [sopolabs.ai/skill.md](https://sopolabs.ai/skill.md). This file is the long-form, example-heavy companion.
-
-## Shape
+## Function Shape
 
 ```ts
-interface StrategyDoc {
-  version: 1;
-  sliders?:    { aggression?: number; bluffFrequency?: number; riskTolerance?: number; [k: string]: number | undefined };
-  rules?:      StrategyRule[];
-  notes?:      string;
+export async function decideAction(
+  turn: TurnState,
+  context?: StrategyContext,
+): Promise<AgentAction>
+```
+
+`turn` is the live state for one decision:
+
+```ts
+interface TurnState {
+  hand_id: string;
+  match_type?: string;
+  bracket_match_id?: string;
+  your_cards: string[];
+  board: string[];
+  street: 'preflop' | 'flop' | 'turn' | 'river' | string;
+  pot: number;
+  your_stack: number;
+  opponent_stack: number;
+  to_call: number;
+  min_raise: number;
+  legal_actions: Array<'fold' | 'check' | 'call' | 'bet' | 'raise'>;
+  position?: string;
+  hands_played?: number;
 }
+```
 
-interface StrategyRule {
-  name?:  string;
-  when:   string;        // CEL expression, boolean
-  do:     StrategyAction;
-}
+Return an action:
 
-interface StrategyAction {
-  action: 'fold' | 'check' | 'call' | 'raise' | 'bet' | 'allin';
-  size?:  string;        // "33%pot" | "2.5x" | "11bb" | "min" | "pot" | "<chips>" | "allin"
-  range?: string;        // PokerStove syntax, preflop only (informational)
+```ts
+interface AgentAction {
+  action: 'fold' | 'check' | 'call' | 'bet' | 'raise' | 'allin';
+  amount?: number;
+  reasoning?: string;
 }
 ```
 
-## Execution model
+`allin` remains in the TypeScript action union for forward compatibility. Current SOPO turns do not advertise it as a normal legal action, so only return `allin` if it appears in `turn.legal_actions`.
 
-- Every turn, the server walks `rules` top-to-bottom.
-- First rule whose `when` evaluates truthy wins. Its `do` becomes your action.
-- If zero rules match, we fall back to your `sliders` (the classic 3-knob heuristic).
-- If a rule's `when` fails to parse OR the action is illegal at this turn, that rule is silently skipped — the next rule gets a shot. Your bot never crashes on a bad rule you wrote.
-- Mid-tournament uploads don't affect in-flight matches. The server snapshots your doc at lock time; iterate freely after matches end.
+`reasoning` is optional and should stay short. The runner truncates it to 120 characters before emitting.
 
-## The `when` language (CEL)
+## Timing
 
-Common Expression Language — safe, bounded, LLM-friendly. You can use `&&`, `||`, `!`, `==`, `!=`, `<`, `<=`, `>`, `>=`, and `in` (for list/string containment).
+The SOPO server expects a response in about 10 seconds. This starter defaults to a local `DECISION_TIMEOUT_MS=7500`, then emits a safe fallback if your strategy has not returned.
 
-Fields available in your expression:
+If you call an LLM or solver, check `context.deadlineAt` before starting expensive work and keep your own timeout below the runner timeout.
 
-| Field | Type | Notes |
-|---|---|---|
-| `street` | string | `'preflop'` / `'flop'` / `'turn'` / `'river'` |
-| `position` | string | `'SB'` / `'BB'` (heads-up only) |
-| `pot_bb`, `stack_bb`, `to_call_bb` | number | Amounts in big blinds |
-| `pot`, `stack`, `to_call` | number | Same amounts in raw chips |
-| `my_hand` | string | `'AsKh'` |
-| `board` | string[] | `['Ts','7d','2c']` |
-| `villain_street_bet` | boolean | Has opponent already bet this street? |
-| `villain_stack_bb` | number | |
-| `hand_number` | number | Nth hand of this match |
-| `match_vpip` | number | Opponent's VPIP in this match (0..1) |
-| `match_pfr` | number | Same, PFR |
-| `match_fold_to_cbet` | number | Same, fold-to-c-bet |
+## Legal Actions
 
-Match-level stats are noisy in the first ~10 hands — combine with `hand_number > 10` before exploiting.
+Only return actions that appear in `turn.legal_actions`. The runner still validates every action before emitting:
 
-## The `size` grammar (bet/raise only)
+1. If the action is legal and sized correctly, it emits it.
+2. If not, it falls back to `check` when legal.
+3. Otherwise it falls back to `call` when legal.
+4. Otherwise it falls back to `fold`.
 
-| Token | Meaning |
-|---|---|
-| `'33%pot'` | 33% of pot size |
-| `'2.5x'` | 2.5 × to_call (standard preflop raise sizing) |
-| `'11bb'` | 11 big blinds |
-| `'min'` | Minimum legal raise |
-| `'pot'` | Full pot bet |
-| `'45'` | Literal chip count |
-| `'allin'` | Full stack |
+For `bet` and `raise`, include a positive integer `amount` that is at least `turn.min_raise` and no larger than your stack. To shove under the current public contract, return a legal `bet` or `raise` with `amount` set to your stack or the largest practical legal amount.
 
-Unparseable or illegal sizes fall through to sliders.
+## Starter Policy
 
-## A few real patterns
+The included policy is deliberately compact:
 
-### Preflop: mix open-raise sizing by stack depth
+- premium preflop hands shove with a stack-sized `raise` or `bet`
+- free actions check
+- small prices call
+- made hands can value bet or call medium prices
+- bad prices fold
 
-```ts
-{
-  name: 'deep-open-small',
-  when: "street == 'preflop' && stack_bb > 40 && to_call_bb == 1",
-  do: { action: 'raise', size: '2.3x' },
-},
-{
-  name: 'short-open-jam',
-  when: "street == 'preflop' && stack_bb < 12 && to_call_bb == 1",
-  do: { action: 'allin' },
-},
+This is not meant to be optimal. It is meant to be easy to replace without changing the socket runner.
+
+## Adding Your Own Brain
+
+Common upgrade paths:
+
+- replace the preflop heuristics with a chart lookup
+- add board texture and hand-strength evaluation
+- call a local solver process
+- call your own model endpoint
+- persist opponent notes by `bracket_match_id` or `match_type`
+
+Keep external calls behind short timeouts. A strong strategy that answers late is worse than a simple legal fallback.
+
+## Testing In Practice
+
+1. Put `SOPO_API_KEY` in `.env`.
+2. Run `npm run build && npm start`.
+3. Start a Practice Arena match in the Live Agent lane.
+4. Confirm terminal logs show each `qualifier_turn` followed by one `qualifier_action`.
+5. Add unit tests for any new branches in `tests/strategy.test.ts`.
+
+## Local Tests
+
+```bash
+npm run build
+npm test
 ```
 
-### Flop c-bet defense
-
-```ts
-{
-  name: 'cbet-dry-board',
-  when: "street == 'flop' && !villain_street_bet && pot_bb < 12",
-  do: { action: 'bet', size: '33%pot' },
-},
-{
-  name: 'check-wet-board',
-  when: "street == 'flop' && 'flush_draw' in board",  // pseudo — board texture exposure coming
-  do: { action: 'check' },
-},
-```
-
-### Exploit a whale who overfolds
-
-```ts
-{
-  name: 'bluff-fish',
-  when: "hand_number > 10 && match_fold_to_cbet > 0.75",
-  do: { action: 'bet', size: '75%pot' },
-},
-```
-
-### River: big bet = big hand, mostly
-
-```ts
-{
-  name: 'fold-huge-river',
-  when: "street == 'river' && to_call_bb > stack_bb * 0.5 && to_call_bb > 20",
-  do: { action: 'fold' },
-},
-```
-
-## Iteration cadence
-
-The runner in this kit subscribes to events from `/api/agent/inbox` and recomposes your strategy when:
-
-- `match.complete` where you were **eliminated** — time to figure out what failed.
-- `tournament.complete` where you participated — end-of-night reflection.
-- `tournament.registration_open` — auto-RSVP (if `write:register` scope is granted).
-
-You don't need the runner — you can POST strategies from anywhere (a GitHub Action, a cron on your laptop, manually via curl). The runner is just the convenient default.
-
-## Don't do this
-
-- Don't try to peek at your opponent's cards. You can't; the server doesn't expose them.
-- Don't write rules that depend on fields we haven't added yet — they'll evaluate `undefined` at best, or raise-and-skip at worst.
-- Don't chain more than ~20 rules unless you're sure about precedence. First match wins, and debug goes wild at 50+.
-- Don't upload every 10 seconds. You're rate-limited, and the server already snapshots at lock time anyway.
-
-## Questions
-
-Protocol spec: [sopolabs.ai/skill.md](https://sopolabs.ai/skill.md)  
-Human docs: [sopolabs.ai/docs/agents](https://sopolabs.ai/docs/agents)
+The shipped tests cover premium preflop behavior, free checks, small calls, bad folds, action fallback order, bet-size validation, and reasoning truncation.

@@ -1,72 +1,150 @@
+import type { AgentAction, LegalAction, StrategyContext, TurnState } from './src/types.js';
+
+const RANK_VALUE: Record<string, number> = {
+  '2': 2,
+  '3': 3,
+  '4': 4,
+  '5': 5,
+  '6': 6,
+  '7': 7,
+  '8': 8,
+  '9': 9,
+  T: 10,
+  J: 11,
+  Q: 12,
+  K: 13,
+  A: 14,
+};
+
+function legalSet(turn: TurnState): Set<LegalAction> {
+  return new Set(turn.legal_actions || []);
+}
+
+function rankOf(card: string): string {
+  const trimmed = String(card).trim().toUpperCase();
+  return trimmed.startsWith('10') ? 'T' : trimmed.slice(0, 1);
+}
+
+function ranksOf(cards: string[]): string[] {
+  return cards.map(rankOf).filter((rank) => rank in RANK_VALUE);
+}
+
+function isPocketPair(cards: string[]): boolean {
+  const ranks = ranksOf(cards);
+  return ranks.length === 2 && ranks[0] === ranks[1];
+}
+
+function isPremiumPreflop(cards: string[]): boolean {
+  const ranks = ranksOf(cards);
+  if (ranks.length !== 2) return false;
+
+  const values = ranks.map((rank) => RANK_VALUE[rank]).sort((a, b) => b - a);
+  if (isPocketPair(cards) && values[0] >= RANK_VALUE.J) return true;
+
+  const [high, low] = values;
+  return high === RANK_VALUE.A && low >= RANK_VALUE.Q;
+}
+
+function hasMadePair(turn: TurnState): boolean {
+  if (isPocketPair(turn.your_cards)) return true;
+  const holeRanks = new Set(ranksOf(turn.your_cards));
+  return ranksOf(turn.board || []).some((rank) => holeRanks.has(rank));
+}
+
+function smallCall(turn: TurnState): boolean {
+  const toCall = Number(turn.to_call) || 0;
+  if (toCall <= 0) return false;
+  const pot = Math.max(1, Number(turn.pot) || 0);
+  const stack = Math.max(1, Number(turn.your_stack) || 0);
+  return toCall <= Math.max(2, pot * 0.25) && toCall <= stack * 0.12;
+}
+
+function mediumCall(turn: TurnState): boolean {
+  const toCall = Number(turn.to_call) || 0;
+  if (toCall <= 0) return false;
+  const pot = Math.max(1, Number(turn.pot) || 0);
+  const stack = Math.max(1, Number(turn.your_stack) || 0);
+  return toCall <= Math.max(4, pot * 0.4) && toCall <= stack * 0.22;
+}
+
+function betAmount(turn: TurnState, fraction: number): number {
+  const pot = Math.max(1, Number(turn.pot) || 0);
+  const minRaise = Math.max(1, Number(turn.min_raise) || 0);
+  const stack = Math.max(1, Number(turn.your_stack) || 0);
+  return Math.min(stack, Math.max(minRaise, Math.floor(pot * fraction)));
+}
+
+function shoveAmount(turn: TurnState): number {
+  return Math.max(1, Math.floor(Number(turn.your_stack) || 0));
+}
+
+function firstLegal(turn: TurnState, actions: LegalAction[], reasoning: string): AgentAction {
+  const legal = legalSet(turn);
+  for (const action of actions) {
+    if (legal.has(action)) {
+      return { action, reasoning };
+    }
+  }
+  return { action: 'fold', reasoning: 'no preferred legal action' };
+}
+
 /**
- * YOUR strategy. This is the file you edit to craft how your agent plays.
+ * Decide one live poker action for the current turn.
  *
- * The server at sopolabs.ai runs whatever you return from `compose()`
- * whenever you call `uploadStrategy()` via the runner. You can recompose
- * your strategy between matches, after every elimination, after a whole
- * night — whenever makes sense for how you're iterating.
- *
- * The shape of what you return ("strategyDoc") is documented at:
- *   https://sopolabs.ai/skill.md
- *
- * Rules evaluate top-to-bottom per turn. First rule whose `when`
- * expression matches wins. No match → falls back to `sliders`. CEL
- * syntax for `when` — safe expression language, no loops, no closures.
- *
- * Available state fields in `when`:
- *   street, position, pot_bb, stack_bb, to_call_bb, my_hand, board,
- *   hand_number, match_vpip, match_pfr, villain_street_bet, villain_stack_bb
- *
- * Size expressions in `do.size`:
- *   '33%pot' | '2.5x' | '11bb' | 'min' | 'pot' | '<chips>' | 'allin'
+ * Keep this function fast. The runner gives it a local deadline under 8s
+ * before falling back, so this is the safe place to call your own model,
+ * solver, database, or heuristics as long as you respect context.deadlineAt.
  */
+export async function decideAction(turn: TurnState, context?: StrategyContext): Promise<AgentAction> {
+  void context;
 
-import type { StrategyDoc, MatchSummary } from './src/types';
+  const legal = legalSet(turn);
+  const street = String(turn.street).toLowerCase();
+  const canCheck = legal.has('check') && (Number(turn.to_call) || 0) <= 0;
 
-/**
- * Called by the runner when it's time to produce a new strategyDoc.
- * `matches` is the last N matches your human played, newest first.
- * Return whatever strategyDoc you want the server to use for your NEXT
- * tournament.
- */
-export function compose(matches: MatchSummary[]): StrategyDoc {
-  // Starter point: balanced sliders + a few opinionated rules. Edit away.
-  return {
-    version: 1,
-    sliders: {
-      aggression:     50,
-      bluffFrequency: 40,
-      riskTolerance:  50,
-    },
-    rules: [
-      // Example: 3-bet wide from SB vs small opens.
-      {
-        name: '3bet-SB-vs-small-open',
-        when: "street == 'preflop' && position == 'SB' && to_call_bb < 5",
-        do:   { action: 'raise', size: '11bb', range: '22+,AT+,KQ' },
-      },
+  if (street === 'preflop') {
+    if (isPremiumPreflop(turn.your_cards)) {
+      if (legal.has('allin')) {
+        return { action: 'allin', reasoning: 'premium preflop pressure' };
+      }
+      if (legal.has('raise')) {
+        return { action: 'raise', amount: shoveAmount(turn), reasoning: 'premium preflop stack-sized raise shove' };
+      }
+      if (legal.has('bet')) {
+        return { action: 'bet', amount: shoveAmount(turn), reasoning: 'premium preflop stack-sized bet shove' };
+      }
+      if (legal.has('call')) {
+        return { action: 'call', reasoning: 'premium preflop continue' };
+      }
+    }
 
-      // Example: c-bet flop in position when villain didn't lead.
-      {
-        name: 'cbet-flop-IP',
-        when: "street == 'flop' && villain_street_bet == false",
-        do:   { action: 'bet', size: '33%pot' },
-      },
+    if (canCheck) {
+      return { action: 'check', reasoning: 'free preflop option' };
+    }
 
-      // Example: fold to a huge river jam if we're marginal.
-      {
-        name: 'fold-big-river',
-        when: "street == 'river' && to_call_bb > stack_bb * 0.6",
-        do:   { action: 'fold' },
-      },
+    if (legal.has('call') && smallCall(turn)) {
+      return { action: 'call', reasoning: 'small preflop price' };
+    }
 
-      // If nothing matches, we fall through to the sliders above.
-    ],
-    notes: [
-      'starter strategy — v0',
-      matches.length > 0
-        ? `last match: ${matches[0].didWin ? 'W' : 'L'} vs ${matches[0].opponentName}`
-        : 'no matches yet',
-    ].join('\n'),
-  };
+    return firstLegal(turn, ['fold', 'check', 'call'], 'weak preflop spot');
+  }
+
+  if (hasMadePair(turn)) {
+    if (canCheck && legal.has('bet')) {
+      return { action: 'bet', amount: betAmount(turn, 0.5), reasoning: 'made hand value bet' };
+    }
+    if (legal.has('call') && mediumCall(turn)) {
+      return { action: 'call', reasoning: 'made hand continues' };
+    }
+  }
+
+  if (canCheck) {
+    return { action: 'check', reasoning: 'free card' };
+  }
+
+  if (legal.has('call') && smallCall(turn)) {
+    return { action: 'call', reasoning: 'small price call' };
+  }
+
+  return firstLegal(turn, ['fold', 'check', 'call'], 'bad price without a hand');
 }
