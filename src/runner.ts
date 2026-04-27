@@ -1,113 +1,137 @@
-/**
- * The runner — the always-on process that keeps your strategy fresh.
- *
- * Loop:
- *   1. Drain new events from the inbox (tournament.*, match.*, strategy.*).
- *   2. When an interesting event arrives (match.complete if you were
- *      eliminated, or tournament.complete), fetch the latest digest.
- *   3. Call strategy.compose() with recent matches.
- *   4. POST the returned strategyDoc to /api/agent/strategy/set.
- *   5. Optionally call registerForNightly() on tournament.registration_open.
- *   6. Sleep until the next poll cycle.
- *
- * The whole thing is HTTP; no persistent WebSocket. Safe to run in a
- * Docker container, GitHub Action, cron job, or literally on your
- * laptop with `npm start`. If you miss a cycle (laptop closed), the
- * server still plays whatever your LAST uploaded strategy was — you're
- * never "offline" in the sense of forfeiting matches.
- */
-
 import 'dotenv/config';
-import { compose } from '../strategy.js';
-import * as api from './api.js';
-import type { MatchSummary } from './types.js';
+import { io, type Socket } from 'socket.io-client';
+import { decideAction } from '../strategy.js';
+import { fallbackAction, sanitizeAgentAction } from './actions.js';
+import type { AgentAction, QualifierAction, RunnerConfig, StrategyContext, TurnState } from './types.js';
 
-const ORIGIN = process.env.SOPO_ORIGIN || 'https://sopolabs.ai';
-const TOKEN = process.env.SOPO_AGENT_TOKEN;
-const POLL_MS = Number(process.env.POLL_MS || 60_000);
-
-if (!TOKEN) {
-  console.error('Missing SOPO_AGENT_TOKEN env var. Mint one at ' + ORIGIN + '/profile/agent-tokens and put it in .env.');
-  process.exit(1);
+interface ServerToClientEvents {
+  qualifier_registered: (payload: unknown) => void;
+  mode_changed: (payload: unknown) => void;
+  qualifier_turn: (turn: TurnState) => void;
 }
 
-const cfg: api.ApiConfig = { origin: ORIGIN, token: TOKEN };
-
-// Event kinds that should trigger a strategy recompose — per skill.md.
-const RECOMPOSE_EVENTS = new Set([
-  'match.complete',         // (if we were eliminated — payload.eliminated)
-  'tournament.complete',    // summary of the whole night
-]);
-const REGISTER_EVENTS = new Set([
-  'tournament.registration_open',
-]);
-
-let cursor: string | null = null;
-
-async function recomposeAndUpload(note: string): Promise<void> {
-  const digest: any = await api.getDigest(cfg);
-  const recent: MatchSummary[] = digest?.facts?.recentMatches
-    ?? digest?.recentMatches
-    ?? [];
-  const doc = compose(recent);
-  const rationale = `runner auto-recompose: ${note}`;
-  const res = await api.uploadStrategy(cfg, doc, rationale);
-  console.log(`[runner] strategy uploaded — version ${res.afterVersion}` +
-    (res.appliedToCurrentTournament === false ? ' (applies to NEXT tournament; current is locked)' : ''));
+interface ClientToServerEvents {
+  qualifier_action: (action: QualifierAction) => void;
 }
 
-async function tick(): Promise<void> {
+const DEFAULT_ORIGIN = 'https://sopolabs.ai';
+const DEFAULT_DECISION_TIMEOUT_MS = 7_500;
+const MAX_DECISION_TIMEOUT_MS = 7_900;
+
+function parseDecisionTimeoutMs(value: string | undefined): number {
+  if (!value) return DEFAULT_DECISION_TIMEOUT_MS;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_DECISION_TIMEOUT_MS;
+  return Math.min(Math.floor(parsed), MAX_DECISION_TIMEOUT_MS);
+}
+
+function readConfig(): RunnerConfig {
+  const origin = process.env.SOPO_ORIGIN || DEFAULT_ORIGIN;
+  const apiKey = process.env.SOPO_API_KEY;
+  const agentName = process.env.AGENT_NAME || undefined;
+
+  if (!apiKey) {
+    console.error('Missing SOPO_API_KEY env var. Create a Live Agent key in SOPO and put it in .env.');
+    process.exit(1);
+  }
+
+  return {
+    origin,
+    apiKey,
+    agentName,
+    decisionTimeoutMs: parseDecisionTimeoutMs(process.env.DECISION_TIMEOUT_MS),
+  };
+}
+
+function describeTurn(turn: TurnState): string {
+  return [
+    `hand=${turn.hand_id}`,
+    `street=${turn.street}`,
+    `pot=${turn.pot}`,
+    `to_call=${turn.to_call}`,
+    `legal=${(turn.legal_actions || []).join(',')}`,
+  ].join(' ');
+}
+
+async function decideWithTimeout(turn: TurnState, cfg: RunnerConfig): Promise<AgentAction> {
+  const startedAt = Date.now();
+  const context: StrategyContext = {
+    startedAt,
+    deadlineAt: startedAt + cfg.decisionTimeoutMs,
+    budgetMs: cfg.decisionTimeoutMs,
+    origin: cfg.origin,
+    agentName: cfg.agentName,
+  };
+
+  let timeout: NodeJS.Timeout | undefined;
+  const timeoutAction = new Promise<AgentAction>((resolve) => {
+    timeout = setTimeout(() => {
+      resolve(fallbackAction(turn, 'decision timeout'));
+    }, cfg.decisionTimeoutMs);
+  });
+
   try {
-    const { events, nextCursor } = await api.drainInbox(cfg, cursor);
-    cursor = nextCursor;
-    if (events.length > 0) {
-      console.log(`[runner] ${events.length} new event(s)`);
-    }
-    for (const evt of events) {
-      if (REGISTER_EVENTS.has(evt.kind)) {
-        try {
-          const r = await api.registerForNightly(cfg);
-          console.log(`[runner] register: ${r.alreadyRegistered ? 'already registered' : 'registered'} for ${r.tournament.id}`);
-        } catch (e) {
-          console.log('[runner] register failed:', (e as Error).message);
-        }
-      }
-      if (RECOMPOSE_EVENTS.has(evt.kind)) {
-        const payload = evt.payload as any;
-        // Heuristic: recompose on match.complete only when the user was
-        // eliminated. Recompose always on tournament.complete.
-        const shouldRecompose = evt.kind === 'tournament.complete'
-          || (evt.kind === 'match.complete' && payload?.eliminated);
-        if (shouldRecompose) {
-          try {
-            await recomposeAndUpload(`event=${evt.kind}`);
-          } catch (e) {
-            console.log('[runner] recompose failed:', (e as Error).message);
-          }
-        }
-      }
-    }
-  } catch (e) {
-    console.log('[runner] tick error:', (e as Error).message);
+    return await Promise.race([
+      Promise.resolve(decideAction(turn, context)),
+      timeoutAction,
+    ]);
+  } catch (error) {
+    console.log('[runner] strategy error:', (error as Error).message);
+    return fallbackAction(turn, 'strategy error');
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
 }
 
-async function main(): Promise<void> {
-  console.log(`[runner] starting — origin=${ORIGIN} poll=${POLL_MS}ms`);
-  // Seed once at startup so the user's strategy reflects their current
-  // match history even if no events fire for a while.
-  try {
-    await recomposeAndUpload('startup seed');
-  } catch (e) {
-    console.log('[runner] startup seed failed:', (e as Error).message);
-  }
-  while (true) {
-    await tick();
-    await new Promise((r) => setTimeout(r, POLL_MS));
-  }
+async function handleTurn(socket: Socket<ServerToClientEvents, ClientToServerEvents>, cfg: RunnerConfig, turn: TurnState): Promise<void> {
+  console.log(`[runner] qualifier_turn ${describeTurn(turn)}`);
+  const rawAction = await decideWithTimeout(turn, cfg);
+  const action = sanitizeAgentAction(rawAction, turn);
+  socket.emit('qualifier_action', action);
+  console.log(`[runner] qualifier_action hand=${action.hand_id} action=${action.action}` +
+    (action.amount ? ` amount=${action.amount}` : '') +
+    (action.reasoning ? ` reason="${action.reasoning}"` : ''));
 }
 
-main().catch((e) => {
-  console.error('[runner] fatal:', e);
-  process.exit(1);
-});
+function main(): void {
+  const cfg = readConfig();
+  const socket: Socket<ServerToClientEvents, ClientToServerEvents> = io(cfg.origin, {
+    auth: {
+      role: 'qualifier',
+      apiKey: cfg.apiKey,
+      name: cfg.agentName,
+    },
+    transports: ['websocket'],
+    reconnection: true,
+    reconnectionAttempts: Infinity,
+    timeout: 5_000,
+  });
+
+  console.log(`[runner] connecting origin=${cfg.origin} name=${cfg.agentName || 'unnamed'} budget=${cfg.decisionTimeoutMs}ms`);
+
+  socket.on('connect', () => {
+    console.log(`[runner] connected socket=${socket.id}`);
+  });
+
+  socket.on('disconnect', (reason) => {
+    console.log(`[runner] disconnected reason=${reason}`);
+  });
+
+  socket.on('connect_error', (error) => {
+    console.log('[runner] connect_error:', error.message);
+  });
+
+  socket.on('qualifier_registered', (payload) => {
+    console.log('[runner] qualifier_registered', JSON.stringify(payload));
+  });
+
+  socket.on('mode_changed', (payload) => {
+    console.log('[runner] mode_changed', JSON.stringify(payload));
+  });
+
+  socket.on('qualifier_turn', (turn) => {
+    void handleTurn(socket, cfg, turn);
+  });
+}
+
+main();

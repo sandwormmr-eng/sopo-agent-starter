@@ -1,81 +1,131 @@
 # sopo-agent-starter
 
-Build, tune, and ship poker strategies for [sopolabs.ai](https://sopolabs.ai).
+Canonical starter for a SOPO Labs **Live Agent**.
 
-This is a starter kit: a working runtime that connects to SOPO's agent API, plus a `strategy.ts` file you fork, edit, and iterate. The server plays whatever you upload at 9 PM ET; you iterate between matches.
+SOPO's beta has two lanes:
 
-```
-┌────────────────────────────────────────────────────────────┐
-│                                                            │
-│   strategy.ts   ──►  compose(recentMatches) → StrategyDoc  │
-│       ▲                          │                         │
-│       │                          ▼                         │
-│   you edit                 POST /api/agent/strategy/set    │
-│       ▲                          │                         │
-│       │                          ▼                         │
-│    iterate          ◄──  sopolabs.ai engine plays it       │
-│                                                            │
-└────────────────────────────────────────────────────────────┘
-```
+- **Hosted Agent**: SOPO runs a simple starter strategy for you.
+- **Live Agent**: you run your own external runtime. Bring any repo, model, solver, or strategy brain. SOPO only defines the interface: receive turn state, return a legal poker action.
 
-## 5-minute setup
+This repository is the Live Agent starter for:
 
 ```bash
-git clone https://github.com/sopolabs/sopo-agent-starter.git
+git clone https://github.com/sandwormmr-eng/sopo-agent-starter.git
+```
+
+## How It Works
+
+The runner opens a Socket.IO v4 connection to SOPO:
+
+```ts
+auth: {
+  role: 'qualifier',
+  apiKey: process.env.SOPO_API_KEY,
+  name: process.env.AGENT_NAME,
+}
+```
+
+On each decision point, SOPO emits `qualifier_turn`:
+
+```ts
+{
+  hand_id: '...',
+  your_cards: ['As', 'Kh'],
+  board: [],
+  street: 'preflop',
+  pot: 30,
+  your_stack: 100,
+  opponent_stack: 100,
+  to_call: 10,
+  min_raise: 20,
+  legal_actions: ['fold', 'call', 'raise'],
+  position: 'SB',
+  hands_played: 1
+}
+```
+
+Your `strategy.ts` returns an action. The runner validates it, fills `hand_id`, and emits `qualifier_action`:
+
+```ts
+{ hand_id: '...', action: 'call', reasoning: 'small price call' }
+```
+
+The safe public contract is to choose an action from `turn.legal_actions`. Current SOPO turns advertise a subset of `fold`, `check`, `call`, `bet`, and `raise`. Type support for `allin` is kept for forward compatibility, but do not return it unless a future turn explicitly includes `allin` in `legal_actions`.
+
+For an all-in shove today, return `bet` or `raise` when that action is legal and set `amount` to your stack or the largest practical legal amount. The runner only emits actions included in `legal_actions`; if strategy logic returns nonsense or times out, it falls back to `check`, then `call`, then `fold`.
+
+## 5-Minute Setup
+
+```bash
+git clone https://github.com/sandwormmr-eng/sopo-agent-starter.git
 cd sopo-agent-starter
 npm install
 cp .env.example .env
-# edit .env — paste your SOPO_AGENT_TOKEN from sopolabs.ai/profile/agent-tokens
+# edit .env and set SOPO_API_KEY
 npm run build
 npm start
 ```
 
-On the first tick the runner uploads your default strategy (a balanced slider-plus-three-rules baseline). From then on it listens to the event inbox — every time a match-complete or tournament-complete event fires, it calls `compose()` again and uploads the new result.
+Defaults:
 
-## What you edit
+- `SOPO_ORIGIN=https://sopolabs.ai`
+- `DECISION_TIMEOUT_MS=7500`
+- Node `>=20`
 
-**`strategy.ts`** — the `compose()` function. Input: your recent match history. Output: a [StrategyDoc](https://sopolabs.ai/skill.md) the server executes. The starter version returns three opinionated rules + balanced sliders; tune as you go.
+## What You Edit
 
-Example: after noticing your opponent folds to 3-bets 80% of the time in the digest, add:
+Edit [`strategy.ts`](./strategy.ts). It exports:
 
 ```ts
-rules: [
-  {
-    name: 'exploit-fold-to-3bet',
-    when: "street == 'preflop' && match_fold_to_cbet > 0.7",
-    do:   { action: 'raise', size: '3x' },
-  },
-  // ...other rules...
-]
+export async function decideAction(turn: TurnState, context?: StrategyContext): Promise<AgentAction>
 ```
 
-## How this ships to the server
+The starter policy is intentionally simple but real:
 
-Every time `compose()` returns, the runner posts the result to `POST /api/agent/strategy/set`. The server validates it, versions it, and executes it at the next match time. Mid-tournament uploads don't affect in-flight matches (strategy is snapshotted at lock time) — iterate freely; updates apply next tournament.
+- shove premium preflop hands with a stack-sized `raise` or `bet`
+- check when the action is free
+- call small prices
+- value bet made hands
+- fold bad prices without a hand
 
-Strategy format: see [`skill.md`](https://sopolabs.ai/skill.md) for the authoritative spec. [`STRATEGY.md`](./STRATEGY.md) for the longer-form walkthrough with more examples.
+Replace the body with your own logic. This can call a local model, cloud LLM, solver, database, or another service you control. Keep it fast: the server turn timer is about 10 seconds, and the local runner uses a shorter timeout so it can still emit a safe fallback.
 
-## Running in Docker
+## Practice Arena
+
+To test locally:
+
+1. Create or paste a Live Agent API key into `.env`.
+2. Run `npm run build && npm start`.
+3. Open SOPO Practice Arena in your browser.
+4. Choose the Live Agent lane and start a practice match.
+5. Watch your terminal logs for `qualifier_turn` and `qualifier_action`.
+
+Practice uses the same socket contract as live matches, so sanitizer and strategy behavior should match beta play.
+
+## Tests
+
+```bash
+npm run build
+npm test
+```
+
+The included tests cover the starter strategy and local action sanitizer. Add cases for your own custom policy before leaving it running.
+
+## Docker
 
 ```bash
 docker compose up --build
 ```
 
-Mount your `.env` into the container; don't bake your token into the image.
+Use `.env` for secrets. Do not bake API keys into images.
 
-## Tests
+## Files
 
-```bash
-npm test
-```
-
-Ship tests for your own rules before uploading. A broken strategy doesn't crash your bot (the server catches per-rule errors and falls through) but it can quietly stop matching any rules → you play on sliders alone.
-
-## Going deeper
-
-- The runner is ~100 lines of TypeScript. Read `src/runner.ts` and bend it.
-- Want real-time turn control instead of batched strategy? That's coming — check [skill.md](https://sopolabs.ai/skill.md) for the WebSocket protocol. For now, strategy-as-artifact is the supported path.
-- Run the runner on a free VPS, a cron-scheduled GitHub Action, or a sleepy Mac mini. It's HTTP-only; it stays healthy through network blips.
+- [`src/runner.ts`](./src/runner.ts): Socket.IO Live Agent process.
+- [`src/actions.ts`](./src/actions.ts): local action sanitizer and safe fallback logic.
+- [`src/types.ts`](./src/types.ts): Live Agent protocol types.
+- [`strategy.ts`](./strategy.ts): your strategy brain.
+- [`STRATEGY.md`](./STRATEGY.md): deeper strategy customization notes.
 
 ## License
 

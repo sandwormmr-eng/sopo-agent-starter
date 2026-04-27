@@ -1,55 +1,124 @@
-/**
- * Tests for YOUR strategy.ts. Run with `npm test`.
- *
- * Writing tests is how the serious SOPO grinders avoid shipping broken
- * rule sets. Before you upload a new strategy, make sure it at least
- * produces a well-formed StrategyDoc across the inputs you care about.
- *
- * This file ships with a few baseline tests. Add your own.
- */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { compose } from '../strategy.js';
-import type { MatchSummary } from '../src/types.js';
+import { sanitizeAgentAction } from '../src/actions.js';
+import { decideAction } from '../strategy.js';
+import type { AgentAction, TurnState } from '../src/types.js';
 
-test('compose returns a valid StrategyDoc with no match history', () => {
-  const doc = compose([]);
-  assert.equal(doc.version, 1);
-  assert.ok(doc.sliders, 'sliders should be present');
-  assert.ok(Array.isArray(doc.rules), 'rules should be an array');
+function turn(overrides: Partial<TurnState> = {}): TurnState {
+  return {
+    hand_id: 'hand-1',
+    match_type: 'practice',
+    bracket_match_id: 'match-1',
+    your_cards: ['As', 'Kh'],
+    board: [],
+    street: 'preflop',
+    pot: 30,
+    your_stack: 100,
+    opponent_stack: 100,
+    to_call: 10,
+    min_raise: 20,
+    legal_actions: ['fold', 'call', 'raise'],
+    position: 'SB',
+    hands_played: 1,
+    ...overrides,
+  };
+}
+
+test('starter strategy uses a stack-sized raise for premium preflop pressure', async () => {
+  const action = await decideAction(turn({ your_cards: ['Ah', 'Ad'] }));
+  assert.equal(action.action, 'raise');
+  assert.equal(action.amount, 100);
+  assert.match(action.reasoning || '', /stack-sized/);
 });
 
-test('every slider value is in [0, 100]', () => {
-  const doc = compose([]);
-  for (const [name, v] of Object.entries(doc.sliders || {})) {
-    assert.ok(typeof v === 'number' && v >= 0 && v <= 100,
-      `slider ${name}=${v} out of range`);
-  }
-});
-
-test('every rule has when + do.action', () => {
-  const doc = compose([]);
-  for (const rule of doc.rules || []) {
-    assert.equal(typeof rule.when, 'string', `rule.when not a string: ${JSON.stringify(rule)}`);
-    assert.ok(rule.when.length > 0, 'rule.when is empty');
-    assert.ok(rule.do && typeof rule.do.action === 'string', 'rule.do.action missing');
-    assert.ok(['fold','check','call','raise','bet','allin'].includes(rule.do.action),
-      `unknown action: ${rule.do.action}`);
-  }
-});
-
-test('compose handles a losing-streak history without crashing', () => {
-  const matches: MatchSummary[] = Array.from({ length: 5 }, (_, i) => ({
-    matchId: `m${i}`,
-    tournamentId: 't',
-    opponentName: `bot${i}`,
-    didWin: false,
-    totalHands: 40,
-    totalPot: 200,
-    startedAt: '2026-04-22T01:00:00Z',
-    eloBefore: 1200,
-    eloAfter: 1180 - i * 10,
+test('starter strategy uses a stack-sized bet when raise is not legal', async () => {
+  const action = await decideAction(turn({
+    your_cards: ['Ah', 'Ad'],
+    to_call: 0,
+    legal_actions: ['check', 'bet'],
   }));
-  const doc = compose(matches);
-  assert.ok(doc, 'compose should return a doc even after losses');
+  assert.equal(action.action, 'bet');
+  assert.equal(action.amount, 100);
+  assert.match(action.reasoning || '', /stack-sized/);
+});
+
+test('starter strategy only returns allin when allin is legal', async () => {
+  const action = await decideAction(turn({
+    your_cards: ['Ah', 'Ad'],
+    legal_actions: ['fold', 'call', 'raise', 'allin'],
+  }));
+  assert.equal(action.action, 'allin');
+});
+
+test('starter strategy checks when facing no bet', async () => {
+  const action = await decideAction(turn({
+    street: 'flop',
+    your_cards: ['7h', '2d'],
+    board: ['As', 'Kd', '4c'],
+    to_call: 0,
+    legal_actions: ['check', 'bet'],
+  }));
+  assert.equal(action.action, 'check');
+});
+
+test('starter strategy calls small prices and folds bad prices', async () => {
+  const small = await decideAction(turn({
+    your_cards: ['8h', '7h'],
+    to_call: 2,
+    legal_actions: ['fold', 'call'],
+  }));
+  assert.equal(small.action, 'call');
+
+  const bad = await decideAction(turn({
+    your_cards: ['8h', '7h'],
+    to_call: 80,
+    legal_actions: ['fold', 'call'],
+  }));
+  assert.equal(bad.action, 'fold');
+});
+
+test('sanitizer preserves a legal sized raise and adds hand_id', () => {
+  const action = sanitizeAgentAction(
+    { action: 'raise', amount: 25, reasoning: 'value raise' } satisfies AgentAction,
+    turn(),
+  );
+  assert.deepEqual(action, {
+    hand_id: 'hand-1',
+    action: 'raise',
+    amount: 25,
+    reasoning: 'value raise',
+  });
+});
+
+test('sanitizer falls back check, then call, then fold', () => {
+  assert.equal(sanitizeAgentAction({ action: 'banana' }, turn({
+    to_call: 0,
+    legal_actions: ['check', 'bet'],
+  })).action, 'check');
+
+  assert.equal(sanitizeAgentAction({ action: 'banana' }, turn({
+    legal_actions: ['call', 'fold'],
+  })).action, 'call');
+
+  assert.equal(sanitizeAgentAction({ action: 'banana' }, turn({
+    legal_actions: ['fold'],
+  })).action, 'fold');
+});
+
+test('sanitizer rejects invalid bet sizing', () => {
+  const action = sanitizeAgentAction(
+    { action: 'raise', amount: 5, reasoning: 'too small' },
+    turn({ legal_actions: ['fold', 'call', 'raise'], min_raise: 20 }),
+  );
+  assert.equal(action.action, 'call');
+});
+
+test('sanitizer truncates long reasoning', () => {
+  const action = sanitizeAgentAction(
+    { action: 'call', reasoning: 'x'.repeat(200) },
+    turn({ legal_actions: ['fold', 'call'] }),
+  );
+  assert.equal(action.action, 'call');
+  assert.ok(action.reasoning);
+  assert.ok(action.reasoning.length <= 120);
 });
